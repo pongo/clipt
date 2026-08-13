@@ -1,100 +1,82 @@
 const std = @import("std");
-const print = std.debug.print;
-const ArrayList = std.ArrayList;
-const Allocator = std.mem.Allocator;
 
 const windows = std.os.windows;
-const WINAPI = windows.WINAPI;
+const HGLOBAL = *anyopaque;
 
-// Windows API functions
-extern "user32" fn OpenClipboard(hWndNewOwner: ?windows.HWND) callconv(WINAPI) windows.BOOL;
-extern "user32" fn CloseClipboard() callconv(WINAPI) windows.BOOL;
-extern "user32" fn EmptyClipboard() callconv(WINAPI) windows.BOOL;
-extern "user32" fn SetClipboardData(uFormat: windows.UINT, hMem: windows.HANDLE) callconv(WINAPI) ?windows.HANDLE;
-extern "kernel32" fn GlobalAlloc(uFlags: windows.UINT, dwBytes: windows.SIZE_T) callconv(WINAPI) ?windows.HANDLE;
-extern "kernel32" fn GlobalLock(hMem: windows.HANDLE) callconv(WINAPI) ?*anyopaque;
-extern "kernel32" fn GlobalUnlock(hMem: windows.HANDLE) callconv(WINAPI) windows.BOOL;
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+const ERROR_BROKEN_PIPE: u32 = 109;
 
-const CF_TEXT = 1;
-const GMEM_MOVEABLE = 0x0002;
+extern "user32" fn OpenClipboard(owner: ?windows.HWND) callconv(.winapi) windows.BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn EmptyClipboard() callconv(.winapi) windows.BOOL;
+extern "user32" fn SetClipboardData(format: u32, data: ?HGLOBAL) callconv(.winapi) ?HGLOBAL;
+extern "kernel32" fn GlobalAlloc(flags: u32, bytes: usize) callconv(.winapi) ?HGLOBAL;
+extern "kernel32" fn GlobalLock(memory: HGLOBAL) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(memory: HGLOBAL) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn ReadFile(handle: windows.HANDLE, buffer: [*]u8, bytes: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) u32;
+extern "kernel32" fn GetOEMCP() callconv(.winapi) u32;
+extern "kernel32" fn MultiByteToWideChar(code_page: u32, flags: u32, input: [*]const u8, input_len: c_int, output: ?[*]u16, output_len: c_int) callconv(.winapi) c_int;
 
-fn setClipboardText(text: []const u8) !void {
-    // Open clipboard
-    if (OpenClipboard(null) == 0) {
-        return error.CannotOpenClipboard;
-    }
-    defer _ = CloseClipboard();
-
-    // Empty clipboard
-    if (EmptyClipboard() == 0) {
-        return error.CannotEmptyClipboard;
-    }
-
-    // Allocate global memory for the text (including null terminator)
-    const hMem = GlobalAlloc(GMEM_MOVEABLE, text.len + 1) orelse {
-        return error.CannotAllocateMemory;
-    };
-
-    // Lock the memory and copy text
-    const pMem = GlobalLock(hMem) orelse {
-        return error.CannotLockMemory;
-    };
-
-    const dest: [*]u8 = @ptrCast(pMem);
-    @memcpy(dest[0..text.len], text);
-    dest[text.len] = 0; // null terminator
-
-    _ = GlobalUnlock(hMem);
-
-    // Set clipboard data
-    if (SetClipboardData(CF_TEXT, hMem) == null) {
-        return error.CannotSetClipboardData;
-    }
+fn fail(message: []const u8) noreturn {
+    std.debug.print("clipt: {s}\n", .{message});
+    std.process.exit(1);
 }
 
-fn trimWhitespace(text: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = text.len;
-
-    // Trim from start
-    while (start < text.len and std.ascii.isWhitespace(text[start])) {
-        start += 1;
+fn decodeInput(allocator: std.mem.Allocator, input: []const u8) ![]u16 {
+    if (std.unicode.utf8ValidateSlice(input)) {
+        return std.unicode.utf8ToUtf16LeAlloc(allocator, input);
     }
 
-    // Trim from end
-    while (end > start and std.ascii.isWhitespace(text[end - 1])) {
-        end -= 1;
-    }
+    var code_page = GetConsoleOutputCP();
+    if (code_page == 0 or code_page == 65001) code_page = GetOEMCP();
+    const input_len: c_int = std.math.cast(c_int, input.len) orelse fail("input is too large");
+    const output_len = MultiByteToWideChar(code_page, 0, input.ptr, input_len, null, 0);
+    if (output_len == 0 and input.len != 0) fail("MultiByteToWideChar failed");
 
-    return text[start..end];
+    const output = try allocator.alloc(u16, @intCast(output_len));
+    errdefer allocator.free(output);
+    if (output_len != 0 and MultiByteToWideChar(code_page, 0, input.ptr, input_len, output.ptr, output_len) == 0) {
+        fail("MultiByteToWideChar failed");
+    }
+    return output;
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Read from stdin
-    const stdin = std.io.getStdIn().reader();
-    var input_buffer = ArrayList(u8).init(allocator);
+    const allocator = std.heap.page_allocator;
+    var input_buffer = std.array_list.Managed(u8).init(allocator);
     defer input_buffer.deinit();
-
-    // Read all input
+    const stdin = GetStdHandle(0xfffffff6);
+    var chunk: [8192]u8 = undefined;
     while (true) {
-        var buffer: [1024]u8 = undefined;
-        const bytes_read = stdin.read(&buffer) catch |err| {
-            if (err == error.EndOfStream) break;
-            return err;
-        };
-        
-        if (bytes_read == 0) break;
-        
-        try input_buffer.appendSlice(buffer[0..bytes_read]);
+        var count: u32 = 0;
+        if (!ReadFile(stdin, &chunk, chunk.len, &count, null).toBool()) {
+            if (GetLastError() == ERROR_BROKEN_PIPE) break;
+            fail("ReadFile failed");
+        }
+        if (count == 0) break;
+        try input_buffer.appendSlice(chunk[0..count]);
     }
+    const input = try input_buffer.toOwnedSlice();
+    defer allocator.free(input);
 
-    // Trim whitespace from input
-    const trimmed_text = trimWhitespace(input_buffer.items);
+    const trimmed = std.mem.trim(u8, input, " \t\n\x0b\x0c\r");
+    const decoded = try decodeInput(allocator, trimmed);
+    defer allocator.free(decoded);
 
-    // Set clipboard with trimmed text
-    try setClipboardText(trimmed_text);
+    const bytes = (decoded.len + 1) * @sizeOf(u16);
+    const handle = GlobalAlloc(GMEM_MOVEABLE, bytes) orelse fail("GlobalAlloc failed");
+    const locked = GlobalLock(handle) orelse fail("GlobalLock failed");
+    const destination = @as([*]u16, @ptrCast(@alignCast(locked)))[0 .. decoded.len + 1];
+    @memcpy(destination[0..decoded.len], decoded);
+    destination[decoded.len] = 0;
+    _ = GlobalUnlock(handle);
+
+    if (!OpenClipboard(null).toBool()) fail("OpenClipboard failed");
+    defer _ = CloseClipboard();
+    if (!EmptyClipboard().toBool()) fail("EmptyClipboard failed");
+    if (SetClipboardData(CF_UNICODETEXT, handle) == null) fail("SetClipboardData failed");
 }
